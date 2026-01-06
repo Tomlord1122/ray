@@ -17,6 +17,7 @@
 #include <gtest/gtest.h>
 
 #include <memory>
+#include <set>
 #include <utility>
 #include <vector>
 
@@ -601,6 +602,99 @@ TEST_F(GcsNodeManagerTest, TestHandleGetAllNodeInfo) {
     node_manager.HandleGetAllNodeInfo(request, &reply, send_reply_callback);
 
     EXPECT_EQ(reply.node_info_list_size(), 2);
+  }
+
+  // Test 13: Multiple IP address selectors with ALIVE filter (optimized IP lookup path)
+  {
+    rpc::GetAllNodeInfoRequest request;
+    request.set_state_filter(rpc::GcsNodeInfo::ALIVE);
+    auto *selector1 = request.add_node_selectors();
+    selector1->set_node_ip_address("192.168.1.1");
+    auto *selector2 = request.add_node_selectors();
+    selector2->set_node_ip_address("192.168.1.3");
+    rpc::GetAllNodeInfoReply reply;
+    node_manager.HandleGetAllNodeInfo(request, &reply, send_reply_callback);
+
+    EXPECT_EQ(reply.node_info_list_size(), 2);
+    // Verify the correct nodes are returned
+    std::set<std::string> returned_ips;
+    for (const auto &node_info : reply.node_info_list()) {
+      returned_ips.insert(node_info.node_manager_address());
+    }
+    EXPECT_TRUE(returned_ips.count("192.168.1.1"));
+    EXPECT_TRUE(returned_ips.count("192.168.1.3"));
+  }
+
+  // Test 14: IP address lookup for non-existent IP
+  {
+    rpc::GetAllNodeInfoRequest request;
+    request.set_state_filter(rpc::GcsNodeInfo::ALIVE);
+    auto *selector = request.add_node_selectors();
+    selector->set_node_ip_address("10.0.0.1");  // Non-existent IP
+    rpc::GetAllNodeInfoReply reply;
+    node_manager.HandleGetAllNodeInfo(request, &reply, send_reply_callback);
+
+    EXPECT_EQ(reply.node_info_list_size(), 0);
+  }
+
+  // Test 15: IP address lookup without state filter (should still work via fallback)
+  {
+    rpc::GetAllNodeInfoRequest request;
+    auto *selector = request.add_node_selectors();
+    selector->set_node_ip_address("192.168.1.2");
+    rpc::GetAllNodeInfoReply reply;
+    node_manager.HandleGetAllNodeInfo(request, &reply, send_reply_callback);
+
+    EXPECT_EQ(reply.node_info_list_size(), 1);
+    EXPECT_EQ(reply.node_info_list(0).node_manager_address(), "192.168.1.2");
+  }
+}
+
+TEST_F(GcsNodeManagerTest, TestIpIndexCleanupOnNodeRemoval) {
+  gcs::GcsNodeManager node_manager(gcs_publisher_.get(),
+                                   gcs_table_storage_.get(),
+                                   *io_context_,
+                                   client_pool_.get(),
+                                   ClusterID::Nil(),
+                                   *fake_ray_event_recorder_,
+                                   "test_session_name");
+
+  // Add a node with specific IP
+  auto node = GenNodeInfo();
+  node->set_node_manager_address("10.20.30.40");
+  node_manager.AddNode(node);
+  auto node_id = NodeID::FromBinary(node->node_id());
+
+  auto send_reply_callback =
+      [](ray::Status status, std::function<void()> f1, std::function<void()> f2) {};
+
+  // Verify node can be found by IP
+  {
+    rpc::GetAllNodeInfoRequest request;
+    request.set_state_filter(rpc::GcsNodeInfo::ALIVE);
+    auto *selector = request.add_node_selectors();
+    selector->set_node_ip_address("10.20.30.40");
+    rpc::GetAllNodeInfoReply reply;
+    node_manager.HandleGetAllNodeInfo(request, &reply, send_reply_callback);
+
+    EXPECT_EQ(reply.node_info_list_size(), 1);
+  }
+
+  // Remove the node
+  rpc::NodeDeathInfo death_info;
+  death_info.set_reason(rpc::NodeDeathInfo::EXPECTED_TERMINATION);
+  node_manager.RemoveNode(node_id, death_info, rpc::GcsNodeInfo::DEAD, 1000);
+
+  // Verify IP index is cleaned up - node should not be found by IP with ALIVE filter
+  {
+    rpc::GetAllNodeInfoRequest request;
+    request.set_state_filter(rpc::GcsNodeInfo::ALIVE);
+    auto *selector = request.add_node_selectors();
+    selector->set_node_ip_address("10.20.30.40");
+    rpc::GetAllNodeInfoReply reply;
+    node_manager.HandleGetAllNodeInfo(request, &reply, send_reply_callback);
+
+    EXPECT_EQ(reply.node_info_list_size(), 0);
   }
 }
 

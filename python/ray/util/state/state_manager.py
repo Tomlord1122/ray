@@ -190,16 +190,17 @@ class StateDataSourceClient:
         """
         if not ip:
             return None
-        # Query GcsNodeInfo to find the node with matching IP address
+        # Query GcsNodeInfo using IP selector for O(1) lookup at GCS server
+        ip_selector = GetAllNodeInfoRequest.NodeSelector(node_ip_address=ip)
         request = GetAllNodeInfoRequest(
-            state_filter=GcsNodeInfo.GcsNodeState.Value("ALIVE")
+            node_selectors=[ip_selector],
+            state_filter=GcsNodeInfo.GcsNodeState.Value("ALIVE"),
         )
         reply = await self._gcs_node_info_stub.GetAllNodeInfo(
             request, timeout=dashboard_consts.GCS_RPC_TIMEOUT_SECONDS
         )
-        for node_info in reply.node_info_list:
-            if node_info.node_manager_address == ip:
-                return NodeID(node_info.node_id).hex()
+        if reply.node_info_list:
+            return NodeID(reply.node_info_list[0].node_id).hex()
         return None
 
     @handle_grpc_network_errors

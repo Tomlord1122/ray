@@ -294,6 +294,32 @@ void GcsNodeManager::HandleGetAllNodeInfo(rpc::GetAllNodeInfoRequest request,
     return;
   }
 
+  // Optimized path if request only wants specific IP addresses (alive nodes only)
+  bool only_ip_filters = node_ids.empty() && node_names.empty() &&
+                         !is_head_node_filter.has_value() && !node_ip_addresses.empty();
+  if (only_ip_filters &&
+      (!request.has_state_filter() ||
+       request.state_filter() == rpc::GcsNodeInfo::ALIVE)) {
+    for (const auto &ip : node_ip_addresses) {
+      if (num_added >= limit) {
+        break;
+      }
+      auto ip_iter = ip_to_alive_node_id_.find(ip);
+      if (ip_iter != ip_to_alive_node_id_.end()) {
+        auto node_iter = alive_nodes_.find(ip_iter->second);
+        if (node_iter != alive_nodes_.end()) {
+          *reply->add_node_info_list() = *node_iter->second;
+          ++num_added;
+        }
+      }
+    }
+    reply->set_total(total_num_nodes);
+    reply->set_num_filtered(total_num_nodes - num_added);
+    GCS_RPC_SEND_REPLY(send_reply_callback, reply, Status::OK());
+    ++counts_[CountType::GET_ALL_NODE_INFO_REQUEST];
+    return;
+  }
+
   // Optimized path if request only wants head node
   if (request.node_selectors_size() == 1 && is_head_node_filter.has_value() &&
       is_head_node_filter.value()) {
@@ -574,6 +600,11 @@ void GcsNodeManager::AddNodeToCache(std::shared_ptr<const rpc::GcsNodeInfo> node
   auto iter = alive_nodes_.find(node_id);
   if (iter == alive_nodes_.end()) {
     alive_nodes_.emplace(node_id, node);
+    // Maintain IP index for O(1) IP-based lookups
+    const auto &ip = node->node_manager_address();
+    if (!ip.empty()) {
+      ip_to_alive_node_id_.emplace(ip, node_id);
+    }
     // Notify all listeners by posting back on their io_context
     for (auto &listener : node_added_listeners_) {
       listener.Post("NodeManager.AddNodeCallback", node);
@@ -639,6 +670,8 @@ std::shared_ptr<const rpc::GcsNodeInfo> GcsNodeManager::RemoveNodeFromCache(
     ray_metric_node_failures_total_.Record(1);
     // Remove from alive nodes.
     alive_nodes_.erase(iter);
+    // Remove from IP index.
+    ip_to_alive_node_id_.erase(removed_node->node_manager_address());
     // Remove from draining nodes if present.
     draining_nodes_.erase(node_id);
     if (node_death_info.reason() == rpc::NodeDeathInfo::UNEXPECTED_TERMINATION) {

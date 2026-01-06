@@ -347,6 +347,11 @@ class GcsNodeManager : public rpc::NodeInfoGcsServiceHandler {
   /// Alive nodes.
   absl::flat_hash_map<NodeID, std::shared_ptr<const rpc::GcsNodeInfo>> alive_nodes_
       ABSL_GUARDED_BY(mutex_);
+  /// Index from IP address to NodeID for O(1) IP-based lookups.
+  /// Invariant: its keys should always correspond to the node_manager_address of nodes
+  /// in `alive_nodes_`, and entries should be removed when nodes are removed.
+  absl::flat_hash_map<std::string, NodeID> ip_to_alive_node_id_
+      ABSL_GUARDED_BY(mutex_);
   /// Draining nodes.
   /// This map is used to store the nodes which have received the drain request.
   /// Invariant: its keys should always be a subset of the keys of `alive_nodes_`,
