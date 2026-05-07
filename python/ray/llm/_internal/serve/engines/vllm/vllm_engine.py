@@ -67,8 +67,8 @@ if TYPE_CHECKING:
     from vllm.entrypoints.openai.speech_to_text.serving import (
         OpenAIServingTranscription,
     )
-    from vllm.entrypoints.pooling.embed.serving import OpenAIServingEmbedding
-    from vllm.entrypoints.pooling.score.serving import ServingScores
+    from vllm.entrypoints.pooling.embed.serving import ServingEmbedding
+    from vllm.entrypoints.pooling.scoring.serving import ServingScores
     from vllm.entrypoints.serve.tokenize.serving import OpenAIServingTokenization
 
 vllm = try_import("vllm")
@@ -87,13 +87,15 @@ def _convert_config_dicts(merged: dict) -> dict:
     which lack the default field values, causing AttributeError when vLLM code
     tries to access those fields.
     """
-    type_hints = typing.get_type_hints(AsyncEngineArgs)
+    fields_by_name = {f.name: f for f in dataclasses.fields(AsyncEngineArgs)}
 
     for key, value in list(merged.items()):
-        if not isinstance(value, dict) or key not in type_hints:
+        if not isinstance(value, dict) or key not in fields_by_name:
             continue
 
-        hint = type_hints[key]
+        hint = fields_by_name[key].type
+        if isinstance(hint, str):
+            continue
 
         # Handle Optional[X] (Union[X, None]) -> X
         origin = typing.get_origin(hint)
@@ -251,13 +253,6 @@ class VLLMEngine(LLMEngine):
             raise ImportError(
                 "vLLM is not installed. Please install it with `pip install ray[llm]`."
             )
-        from vllm import envs as vllm_envs
-
-        if hasattr(vllm_envs, "VLLM_USE_V1") and not vllm_envs.VLLM_USE_V1:
-            logger.error(
-                "vLLM v0 is fully deprecated. As a result in Ray Serve LLM only v1 is supported."
-            )
-
         self.llm_config.setup_engine_backend()
 
         self._running = False
@@ -267,7 +262,7 @@ class VLLMEngine(LLMEngine):
         self._oai_models: Optional["OpenAIServingModels"] = None
         self._oai_serving_chat: Optional["OpenAIServingChat"] = None
         self._oai_serving_completion: Optional["OpenAIServingCompletion"] = None
-        self._oai_serving_embedding: Optional["OpenAIServingEmbedding"] = None
+        self._oai_serving_embedding: Optional["ServingEmbedding"] = None
         self._oai_serving_transcription: Optional["OpenAIServingTranscription"] = None
         self._oai_serving_scores: Optional["ServingScores"] = None
         self._oai_serving_tokenization: Optional["OpenAIServingTokenization"] = None
@@ -436,21 +431,25 @@ class VLLMEngine(LLMEngine):
 
         engine_config: VLLMEngineConfig = self.llm_config.get_engine_config()
 
-        if engine_config.use_gpu:
-            # Create engine config on a task with access to GPU,
-            # as GPU capability may be queried.
+        # If the backend is anything other than CPU, we need to create the
+        # engine config on a task with hardware access.
+        if engine_config.accelerator.requires_remote_initialization:
+            accelerator = engine_config.accelerator
+            accelerator_type = self.llm_config.accelerator_type
+
+            # Initialize options required for the remote task and hardware backend
+            remote_options = {
+                "num_cpus": 0,
+                "runtime_env": callback_ctx.runtime_env,
+                "scheduling_strategy": PlacementGroupSchedulingStrategy(
+                    placement_group=callback_ctx.placement_group,
+                ),
+                **accelerator.get_remote_options(accelerator_type),
+            }
+
             ref = (
-                ray.remote(
-                    num_cpus=0,
-                    num_gpus=0.001,
-                    accelerator_type=self.llm_config.accelerator_type,
-                )(_get_vllm_engine_config)
-                .options(
-                    runtime_env=callback_ctx.runtime_env,
-                    scheduling_strategy=PlacementGroupSchedulingStrategy(
-                        placement_group=callback_ctx.placement_group,
-                    ),
-                )
+                ray.remote(_get_vllm_engine_config)
+                .options(**remote_options)
                 .remote(self.llm_config)
             )
             vllm_engine_args, vllm_engine_config = ray.get(ref)
@@ -679,7 +678,8 @@ class VLLMEngine(LLMEngine):
             raw_request_info
         )
         try:
-            score_response = await self._oai_serving_scores.create_score(
+            assert self._oai_serving_scores is not None
+            score_response = await self._oai_serving_scores(
                 request,
                 raw_request=raw_request,
             )
@@ -687,10 +687,8 @@ class VLLMEngine(LLMEngine):
             yield self._make_error_response(self._oai_serving_scores, e)
             return
 
-        if isinstance(score_response, VLLMErrorResponse):
-            yield ErrorResponse(**score_response.model_dump())
-        else:
-            yield ScoreResponse(**score_response.model_dump())
+        content = json.loads(score_response.body)
+        yield ScoreResponse(**content)
 
     async def tokenize(
         self,
